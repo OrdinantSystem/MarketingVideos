@@ -5,6 +5,7 @@ import {
     FileCode2,
     Plus,
     RotateCcw,
+    ShieldCheck,
 } from 'lucide-react';
 import type { PropsWithChildren } from 'react';
 import { FileTree } from '@/components/creative/file-tree';
@@ -122,6 +123,14 @@ export function CreativeShell({
                     >
                         <RotateCcw className="size-3.5" aria-hidden="true" />
                     </Button>
+
+                    <span
+                        className="flex shrink-0 items-center gap-1.5 rounded-full bg-emerald-50 px-2 py-1 text-[10px] font-semibold text-emerald-800"
+                        title="Creative routes accept requests only from this machine."
+                    >
+                        <ShieldCheck className="size-3" aria-hidden="true" />
+                        <span className="hidden md:inline">Local-only</span>
+                    </span>
 
                     <Button
                         asChild

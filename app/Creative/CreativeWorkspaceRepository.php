@@ -2,34 +2,43 @@
 
 namespace App\Creative;
 
+use App\Creative\Generation\CreativeGenerationService;
 use Illuminate\Support\Arr;
-use Illuminate\Support\Facades\File;
 use Illuminate\Support\Str;
 use RuntimeException;
+use Throwable;
 
 final class CreativeWorkspaceRepository
 {
+    public function __construct(
+        private readonly CreativeGenerationService $generation,
+        private readonly CreativeArtifactValidator $artifactValidator,
+        private readonly CreativeArtifactEligibilityVerifier $artifactEligibility,
+        private readonly EffectiveSelectionResolver $selectionResolver,
+        private readonly FilesystemCreativeStore $store,
+        private readonly CreativePhaseCatalog $phaseCatalog,
+        private readonly ShotPlanResolver $shotPlanResolver,
+        private readonly CreativeMediaDelivery $mediaDelivery,
+    ) {}
+
     /** @return list<array<string, mixed>> */
     public function projects(): array
     {
-        File::ensureDirectoryExists($this->root());
-
-        return collect(File::directories($this->root()))
-            ->map(fn (string $directory): ?array => $this->projectSummary(basename($directory)))
+        return array_values(collect($this->store->projectIds())
+            ->map(fn (string $project): ?array => $this->projectSummary($project))
             ->filter()
             ->sortByDesc('updated_at')
             ->values()
-            ->all();
+            ->all());
     }
 
     /** @return array{project: string, run: string, phase: string} */
     public function createProject(string $name, string $idea, string $startPhase): array
     {
         $project = (Str::slug($name) ?: 'creative-project').'--'.$this->shortId();
-        $createdAt = now('UTC')->toIso8601String();
-        $projectPath = $this->projectPath($project);
+        $createdAt = $this->timestamp();
 
-        MarkdownDocument::write("{$projectPath}/project.md", [
+        $this->store->writeProject($project, [
             'id' => $project,
             'type' => 'creative_project',
             'name' => $name,
@@ -44,25 +53,27 @@ final class CreativeWorkspaceRepository
     /** @return array{project: string, run: string, phase: string} */
     public function createRun(string $project): array
     {
-        $projectDocument = $this->readDocument("{$this->projectPath($project)}/project.md");
+        $projectDocument = $this->store->readProject($project);
         $run = now('UTC')->format('Ymd-His').'--'.$this->shortId();
-        $createdAt = now('UTC')->toIso8601String();
-        $projectPath = $this->projectPath($project);
+        $createdAt = $this->timestamp();
         $startPhase = (string) ($projectDocument['metadata']['start_phase'] ?? 'concepts');
 
-        MarkdownDocument::write("{$projectPath}/runs/{$run}/run.md", [
+        $this->store->initializeRun($project, $run, [
             'id' => $run,
             'type' => 'creative_run',
             'project' => $project,
             'created_at' => $createdAt,
         ], "# Creative run\n\nThis run begins from the broad idea in `project.md`. Every generated option and selection remains immutable.");
 
-        foreach (array_keys($this->phases()) as $phase) {
-            File::ensureDirectoryExists("{$projectPath}/runs/{$run}/{$this->phaseDirectory($phase)}/outputs");
-            $this->writeCurrentFeedback($project, $run, $phase, '');
+        if ($startPhase === 'concepts') {
+            $this->recordIdeaSourceDecision(
+                $project,
+                $run,
+                'project_idea',
+                'human',
+                'Ideas were explicitly skipped because this run is configured to begin at Concepts.',
+            );
         }
-
-        $this->writeCycleFeedback($project, $run, '');
 
         return compact('project', 'run') + ['phase' => $startPhase];
     }
@@ -71,13 +82,64 @@ final class CreativeWorkspaceRepository
     public function workspace(string $project, string $run, string $phase, ?string $artifactId = null): array
     {
         $this->assertPhase($phase);
-        $projectDocument = $this->readDocument("{$this->projectPath($project)}/project.md");
-        $runDocument = $this->readDocument("{$this->runPath($project, $run)}/run.md");
+        $projectDocument = $this->store->readProject($project);
+        $runDocument = $this->store->readRun($project, $run);
         $artifacts = $this->artifacts($project, $run, $phase);
-        $selected = $this->selectedArtifacts($project, $run, $phase);
-        $artifacts = array_map(fn (array $artifact): array => $artifact + [
-            'selected' => collect($selected)->contains(fn (array $item): bool => $item['artifact_id'] === $artifact['id']),
-        ], $artifacts);
+        $selectionState = $this->selectionState($project, $run, $phase);
+        $selectedIds = collect($selectionState['resolved'])->pluck('artifact.id');
+        $invalidSelectionIds = collect($selectionState['invalid'])->pluck('selection.artifact_id');
+        $selectionsByArtifact = collect($selectionState['resolved'])
+            ->mapWithKeys(fn (array $item): array => [
+                (string) $item['artifact']['id'] => $item['selection'],
+            ]);
+        $invalidSelectionsByArtifact = collect($selectionState['invalid'])
+            ->mapWithKeys(fn (array $item): array => [
+                (string) $item['selection']['artifact_id'] => $item['selection'],
+            ]);
+        $expectedSources = $this->expectedSources($project, $run, $phase);
+        $requiredSlots = $this->requiredSlots($project, $run, $phase);
+        $expectedShots = $this->expectedShotsBySlot($project, $run, $phase);
+        $artifacts = array_map(function (array $artifact) use (
+            $project,
+            $run,
+            $phase,
+            $selectedIds,
+            $invalidSelectionIds,
+            $selectionsByArtifact,
+            $invalidSelectionsByArtifact,
+            $expectedSources,
+            $requiredSlots,
+            $expectedShots,
+        ): array {
+            $validation = $this->artifactValidation(
+                $project,
+                $run,
+                $artifact,
+                $phase,
+                $expectedSources['by_slot'][$artifact['slot']] ?? null,
+                $requiredSlots,
+                $expectedShots[$artifact['slot']] ?? null,
+                $expectedSources['by_slot'],
+                $expectedShots,
+            );
+
+            return $artifact + [
+                'selected' => $selectedIds->contains($artifact['id']),
+                'selection_invalid' => $invalidSelectionIds->contains($artifact['id']),
+                'selection' => $selectionsByArtifact->get((string) $artifact['id']),
+                'invalid_selection' => $invalidSelectionsByArtifact->get((string) $artifact['id']),
+                'validation' => $validation,
+                'asset_url' => $validation['valid']
+                    && ($artifact['asset_status'] ?? null) === MediaAssetContract::STATUS_READY
+                    ? $this->mediaDelivery->artifactUrl(
+                        $project,
+                        $run,
+                        $phase,
+                        (string) $artifact['id'],
+                    )
+                    : null,
+            ];
+        }, $artifacts);
         $activeArtifact = collect($artifacts)->firstWhere('id', $artifactId) ?? Arr::first($artifacts);
         $phaseItems = $this->phaseItems($project, $run, $phase);
 
@@ -92,7 +154,56 @@ final class CreativeWorkspaceRepository
             'artifacts' => $artifacts,
             'activeArtifact' => $activeArtifact,
             'feedback' => $this->feedback($project, $run, $phase),
-            'tree' => $this->tree($this->projectPath($project), $this->projectPath($project)),
+            'generation' => $this->generationState($phase),
+            'shots' => $expectedShots,
+            'concept_source' => $phase === 'concepts'
+                ? $this->effectiveIdeaSource($project, $run)
+                : null,
+            'tree' => $this->store->projectTree($project),
+        ];
+    }
+
+    /**
+     * Lightweight validated read model for automation projection and transitions.
+     *
+     * @return array{
+     *     complete: bool,
+     *     required_slots: list<string>,
+     *     artifacts: list<array<string, mixed>>
+     * }
+     */
+    public function automationPhaseState(string $project, string $run, string $phase): array
+    {
+        $this->assertPhase($phase);
+        $selectionState = $this->selectionState($project, $run, $phase);
+        $selectedIds = collect($selectionState['resolved'])->pluck('artifact.id');
+        $expectedSources = $this->expectedSources($project, $run, $phase);
+        $requiredSlots = $this->requiredSlots($project, $run, $phase);
+        $expectedShots = $this->expectedShotsBySlot($project, $run, $phase);
+        $artifacts = array_map(fn (array $artifact): array => $artifact + [
+            'selected' => $selectedIds->contains($artifact['id']),
+            'validation' => $this->artifactValidation(
+                $project,
+                $run,
+                $artifact,
+                $phase,
+                $expectedSources['by_slot'][$artifact['slot']] ?? null,
+                $requiredSlots,
+                $expectedShots[$artifact['slot']] ?? null,
+                $expectedSources['by_slot'],
+                $expectedShots,
+            ),
+        ], $this->artifacts($project, $run, $phase));
+        $ideaSource = $phase === 'ideas'
+            ? $this->effectiveIdeaSource($project, $run)
+            : null;
+
+        return [
+            'complete' => $phase === 'ideas'
+                ? $this->ideasPhaseComplete($selectionState, $ideaSource)
+                : $selectionState['complete'],
+            'required_slots' => $requiredSlots,
+            'artifacts' => $artifacts,
         ];
     }
 
@@ -112,50 +223,151 @@ final class CreativeWorkspaceRepository
         ];
     }
 
-    public function simulate(string $project, string $run, string $phase): void
+    public function simulate(string $project, string $run, string $phase, bool $forceSimulation = false): string
     {
-        $this->assertPhase($phase);
-        $inputs = $this->inputs($project, $run, $phase);
-
-        if ($phase !== 'ideas' && $phase !== 'concepts' && $inputs === []) {
-            throw new RuntimeException('Select the previous phase output before starting this phase.');
+        $context = $this->phaseContext($project, $run, $phase);
+        if (! $context['ready']) {
+            throw new RuntimeException('Complete every required selection in the previous phase before generating this phase.');
         }
 
-        match ($phase) {
-            'ideas' => $this->writeTextOptions($project, $run, $phase, $this->ideaOptions()),
-            'concepts' => $this->writeTextOptions($project, $run, $phase, $this->conceptOptions()),
-            'brief-script' => $this->writeTextOptions($project, $run, $phase, $this->scriptOptions()),
-            'images' => $this->writeImageOptions($project, $run),
-            'scenes' => $this->writeSceneOptions($project, $run),
-            'sequence' => $this->writeTextOptions($project, $run, $phase, $this->sequenceOptions()),
-            default => throw new RuntimeException('Unknown creative phase.'),
-        };
+        $result = $this->generation->generate(
+            $project,
+            $run,
+            $phase,
+            $context['inputs'],
+            $context['feedback'],
+            $context['required_slots'],
+            $context['expected_sources_by_slot'],
+            simulationOnly: $forceSimulation,
+        );
+
+        return $result['driver'] === 'simulation' ? 'simulation' : 'provider';
+    }
+
+    /**
+     * @return array{
+     *     ready: bool,
+     *     inputs: list<array<string, mixed>>,
+     *     feedback: string,
+     *     required_slots: list<string>,
+     *     expected_sources_by_slot: array<string, list<string>>
+     * }
+     */
+    public function phaseContext(string $project, string $run, string $phase): array
+    {
+        $this->assertPhase($phase);
+        $expectedSources = $this->expectedSources($project, $run, $phase);
+
+        return [
+            'ready' => $expectedSources['ready'],
+            'inputs' => $this->inputs($project, $run, $phase),
+            'feedback' => $this->generationFeedback($project, $run, $phase),
+            'required_slots' => $this->requiredSlots($project, $run, $phase),
+            'expected_sources_by_slot' => $expectedSources['by_slot'],
+        ];
     }
 
     /** @return array{next_phase: string|null, complete: bool} */
-    public function select(string $project, string $run, string $phase, string $artifactId): array
-    {
+    public function select(
+        string $project,
+        string $run,
+        string $phase,
+        string $artifactId,
+        string $selectedBy = 'human',
+        ?string $evaluationId = null,
+        ?string $reason = null,
+    ): array {
+        $this->assertPhase($phase);
+        if (! in_array($selectedBy, ['human', 'automation'], true)) {
+            throw new RuntimeException('Selection actor must be human or automation.');
+        }
+
+        $evaluationId = $evaluationId !== null && trim($evaluationId) !== ''
+            ? trim($evaluationId)
+            : null;
+        $reason = $reason !== null && trim($reason) !== '' ? trim($reason) : null;
         $artifact = collect($this->artifacts($project, $run, $phase))->firstWhere('id', $artifactId);
 
         if (! $artifact) {
             throw new RuntimeException('The selected artifact does not exist.');
         }
 
-        $slot = $artifact['slot'] ?? 'primary';
-        $path = "{$this->runPath($project, $run)}/selections/{$phase}";
-        $selectionId = $this->filename('selection', $artifact['title']);
+        $slot = is_string($artifact['slot'] ?? null) ? $artifact['slot'] : '';
+        $expectedSources = $this->expectedSources($project, $run, $phase);
+        if (! $expectedSources['ready']) {
+            throw new RuntimeException('Complete every required selection in the previous phase first.');
+        }
+        $requiredSlots = $this->requiredSlots($project, $run, $phase);
+        $expectedShots = $this->expectedShotsBySlot($project, $run, $phase);
 
-        MarkdownDocument::write("{$path}/{$selectionId}.md", [
+        $validation = $this->artifactValidation(
+            $project,
+            $run,
+            $artifact,
+            $phase,
+            $expectedSources['by_slot'][$slot] ?? null,
+            $requiredSlots,
+            $expectedShots[$slot] ?? null,
+            $expectedSources['by_slot'],
+            $expectedShots,
+        );
+        if (! $validation['valid']) {
+            throw new RuntimeException('Artifact cannot be selected: '.implode(' ', $validation['errors']));
+        }
+
+        $selectionId = $this->filename('selection', (string) $artifact['title']);
+        $createdAt = $this->timestamp();
+        $selectionMetadata = [
             'id' => $selectionId,
             'type' => 'selection',
             'phase' => $phase,
             'slot' => $slot,
             'artifact_id' => $artifactId,
             'artifact_path' => $artifact['path'],
-            'created_at' => now('UTC')->toIso8601String(),
-        ], "# Selected: {$artifact['title']}\n\nThis immutable record promotes the referenced artifact as the input for the next phase.");
+            'selected_by' => $selectedBy,
+            'evaluation_id' => $evaluationId,
+            'reason' => $reason,
+            'created_at' => $createdAt,
+        ];
+        $selectionBody = "# Selected: {$artifact['title']}\n\nThis immutable record promotes the referenced artifact as the input for the next phase.\n\n## Selection explanation\n\n- Selected by: `{$selectedBy}`\n- Evaluation: ".($evaluationId !== null ? "`{$evaluationId}`" : 'none')."\n\n## Reason\n\n".($reason ?? 'No additional selection reason was recorded.');
 
-        $complete = count($this->selectedArtifacts($project, $run, $phase)) >= count($this->phases()[$phase]['slots']);
+        if ($phase === 'ideas') {
+            $decision = $this->ideaSourceDecisionDocument(
+                $project,
+                'selected_idea',
+                $selectedBy,
+                $reason ?? 'The selected idea should be the source for Concepts.',
+                $artifactId,
+                $selectionId,
+                $createdAt,
+            );
+            $this->store->appendIdeasSelectionWithSourceDecision(
+                $project,
+                $run,
+                $slot,
+                $selectionId,
+                $selectionMetadata,
+                $selectionBody,
+                $decision['id'],
+                $decision['metadata'],
+                $decision['body'],
+            );
+        } else {
+            $this->store->appendSelection(
+                $project,
+                $run,
+                $phase,
+                $slot,
+                $selectionId,
+                $selectionMetadata,
+                $selectionBody,
+            );
+        }
+
+        $selectionState = $this->selectionState($project, $run, $phase);
+        $complete = $phase === 'ideas'
+            ? $this->ideasPhaseComplete($selectionState, $this->effectiveIdeaSource($project, $run))
+            : (bool) $selectionState['complete'];
 
         return [
             'next_phase' => $complete ? $this->nextPhase($phase) : null,
@@ -163,46 +375,134 @@ final class CreativeWorkspaceRepository
         ];
     }
 
+    /** @return array{next_phase: string, complete: true} */
+    public function skipIdeas(
+        string $project,
+        string $run,
+        string $selectedBy = 'human',
+        ?string $reason = null,
+    ): array {
+        $this->store->readProject($project);
+        $this->store->readRun($project, $run);
+        if (! in_array($selectedBy, ['human', 'automation'], true)) {
+            throw new RuntimeException('Ideas skip actor must be human or automation.');
+        }
+
+        $this->recordIdeaSourceDecision(
+            $project,
+            $run,
+            'project_idea',
+            $selectedBy,
+            $reason !== null && trim($reason) !== ''
+                ? trim($reason)
+                : 'Ideas were explicitly skipped; Concepts should use the broad project idea.',
+        );
+
+        return ['next_phase' => 'concepts', 'complete' => true];
+    }
+
+    /**
+     * Recover a missing source decision for the exact current eligible Ideas
+     * selection. Existing exact evidence is returned without another write.
+     *
+     * @return array{
+     *     mode: 'selected_idea'|'project_idea',
+     *     source_id: string,
+     *     source_title: string,
+     *     explicit: bool,
+     *     skipped: bool,
+     *     reason: string|null,
+     *     decision: array<string, mixed>|null
+     * }
+     */
+    public function ensureCurrentIdeaSourceDecision(
+        string $project,
+        string $run,
+        string $selectedBy = 'automation',
+        ?string $reason = null,
+    ): array {
+        $this->store->readProject($project);
+        $this->store->readRun($project, $run);
+        if (! in_array($selectedBy, ['human', 'automation'], true)) {
+            throw new RuntimeException('Ideas source-decision actor must be human or automation.');
+        }
+
+        $source = $this->effectiveIdeaSource($project, $run);
+        if ($source['mode'] === 'selected_idea' && $source['explicit']) {
+            return $source;
+        }
+        if ($source['mode'] === 'project_idea' && $source['explicit']) {
+            throw new RuntimeException('Ideas are currently explicitly skipped; recovery cannot supersede that decision.');
+        }
+
+        $state = $this->selectionState($project, $run, 'ideas');
+        $selection = is_array($state['resolved'][0]['selection'] ?? null)
+            ? $state['resolved'][0]['selection']
+            : null;
+        $artifact = is_array($state['resolved'][0]['artifact'] ?? null)
+            ? $state['resolved'][0]['artifact']
+            : null;
+        $selectionId = is_array($selection) && is_string($selection['id'] ?? null)
+            ? trim($selection['id'])
+            : '';
+        $artifactId = is_array($artifact) && is_string($artifact['id'] ?? null)
+            ? trim($artifact['id'])
+            : '';
+
+        if (! $state['complete'] || $selectionId === '' || $artifactId === '') {
+            throw new RuntimeException('There is no eligible current Ideas selection to recover.');
+        }
+
+        $reason = $reason !== null && trim($reason) !== ''
+            ? trim($reason)
+            : 'Recovered the missing source decision for the current Ideas selection.';
+        $decision = $this->ideaSourceDecisionDocument(
+            $project,
+            'selected_idea',
+            $selectedBy,
+            $reason,
+            $artifactId,
+            $selectionId,
+        );
+        $this->store->ensureIdeaSourceDecisionForCurrentSelection(
+            $project,
+            $run,
+            $selectionId,
+            $artifactId,
+            $decision['id'],
+            $decision['metadata'],
+            $decision['body'],
+        );
+
+        $recovered = $this->effectiveIdeaSource($project, $run);
+        if ($recovered['mode'] !== 'selected_idea'
+            || ! $recovered['explicit']
+            || $recovered['source_id'] !== $artifactId
+            || ($recovered['decision']['selection_id'] ?? null) !== $selectionId) {
+            throw new RuntimeException('The Ideas lineage changed before source-decision recovery completed.');
+        }
+
+        return $recovered;
+    }
+
     public function appendFeedback(string $project, string $run, string $phase, string $scope, string $feedback): void
     {
         $this->assertPhase($phase);
         $entry = "\n## ".now('UTC')->format('Y-m-d H:i:s').' UTC · '.$this->shortId()."\n\n{$feedback}\n";
-
-        if ($scope === 'cycle') {
-            File::append($this->cycleFeedbackPath($project, $run), $entry);
-
-            return;
-        }
-
-        File::append($this->currentFeedbackPath($project, $run, $phase), $entry);
+        $this->store->appendFeedbackEntry($project, $run, $phase, $scope, $entry);
     }
 
     public function archiveFeedback(string $project, string $run, string $phase, string $scope): void
     {
-        $source = $scope === 'cycle'
-            ? $this->cycleFeedbackPath($project, $run)
-            : $this->currentFeedbackPath($project, $run, $phase);
-
-        $document = MarkdownDocument::read($source);
-
-        if (trim($document['body']) === '' || ! str_contains($document['body'], '## ')) {
-            throw new RuntimeException('There is no pending feedback to archive.');
-        }
-
         $historyName = $this->filename('feedback', $scope === 'cycle' ? 'whole-cycle' : $phase);
-        MarkdownDocument::write("{$this->runPath($project, $run)}/feedback/history/{$historyName}.md", [
-            'id' => $historyName,
-            'type' => 'feedback_history',
-            'scope' => $scope,
-            'phase' => $phase,
-            'archived_at' => now('UTC')->toIso8601String(),
-        ], "# Applied feedback snapshot\n\n{$document['body']}\n\n## Implementation note\n\nArchived from the current feedback inbox. A future agent can add implementation references here.");
-
-        if ($scope === 'cycle') {
-            $this->writeCycleFeedback($project, $run, '');
-        } else {
-            $this->writeCurrentFeedback($project, $run, $phase, '');
-        }
+        $this->store->archiveFeedback(
+            $project,
+            $run,
+            $phase,
+            $scope,
+            $historyName,
+            $this->timestamp(),
+        );
     }
 
     public function createDemoProject(): void
@@ -215,53 +515,53 @@ final class CreativeWorkspaceRepository
 
         $project = $created['project'];
         $run = $created['run'];
-        $this->simulate($project, $run, 'ideas');
+        $this->simulate($project, $run, 'ideas', true);
         $idea = $this->artifacts($project, $run, 'ideas')[0];
         $this->select($project, $run, 'ideas', $idea['id']);
-        $this->simulate($project, $run, 'concepts');
+        $this->simulate($project, $run, 'concepts', true);
         $concept = $this->artifacts($project, $run, 'concepts')[0];
         $this->select($project, $run, 'concepts', $concept['id']);
-        $this->simulate($project, $run, 'brief-script');
+        $this->simulate($project, $run, 'brief-script', true);
         $script = $this->artifacts($project, $run, 'brief-script')[0];
         $this->select($project, $run, 'brief-script', $script['id']);
-        $this->simulate($project, $run, 'images');
+        $this->simulate($project, $run, 'images', true);
         $this->appendFeedback($project, $run, 'concepts', 'phase', 'The first concept is strongest. Keep the opening understandable without sound.');
     }
 
     /** @return list<array<string, mixed>> */
     private function artifacts(string $project, string $run, string $phase): array
     {
-        $directory = "{$this->runPath($project, $run)}/{$this->phaseDirectory($phase)}/outputs";
-        File::ensureDirectoryExists($directory);
-
-        return collect(File::files($directory))
-            ->filter(fn (\SplFileInfo $file): bool => $file->getExtension() === 'md')
-            ->map(function (\SplFileInfo $file) use ($directory): array {
-                $document = $this->readDocument($file->getPathname());
-
-                return $document + [
-                    'id' => $document['metadata']['id'] ?? $file->getBasename('.md'),
-                    'title' => $document['metadata']['title'] ?? Str::headline($file->getBasename('.md')),
-                    'summary' => $document['metadata']['summary'] ?? '',
-                    'type' => $document['metadata']['artifact_type'] ?? 'markdown',
-                    'slot' => $document['metadata']['slot'] ?? 'primary',
-                    'variant' => $document['metadata']['variant'] ?? null,
-                    'created_at' => $document['metadata']['created_at'] ?? date(DATE_ATOM, $file->getMTime()),
-                    'path' => Str::after($file->getPathname(), $this->root().'/'),
-                    'filename' => Str::after($file->getPathname(), $directory.'/'),
-                    'preview_color' => $document['metadata']['preview_color'] ?? '#d9d5c8',
-                ];
-            })
-            ->sortByDesc('created_at')
-            ->values()
-            ->all();
+        return $this->store->artifacts($project, $run, $phase);
     }
 
     /** @return list<array<string, mixed>> */
     private function inputs(string $project, string $run, string $phase): array
     {
-        if ($phase === 'ideas' || ($phase === 'concepts' && $this->selectedArtifacts($project, $run, 'ideas') === [])) {
-            return [$this->readDocument("{$this->projectPath($project)}/project.md") + [
+        if ($phase === 'ideas') {
+            return [$this->store->readProject($project) + [
+                'id' => $project,
+                'title' => 'Broad project idea',
+                'path' => "{$project}/project.md",
+                'slot' => 'primary',
+            ]];
+        }
+
+        if ($phase === 'concepts') {
+            $source = $this->effectiveIdeaSource($project, $run);
+            if (! $source['explicit']) {
+                return [];
+            }
+
+            if ($source['mode'] === 'selected_idea') {
+                $ideaState = $this->selectionState($project, $run, 'ideas');
+
+                return array_map(
+                    fn (array $item): array => $item['artifact'] + ['selection' => $item['selection']],
+                    $ideaState['resolved'],
+                );
+            }
+
+            return [$this->store->readProject($project) + [
                 'id' => $project,
                 'title' => 'Broad project idea',
                 'path' => "{$project}/project.md",
@@ -275,92 +575,499 @@ final class CreativeWorkspaceRepository
             return [];
         }
 
-        return collect($this->selectedArtifacts($project, $run, $previous))
-            ->map(function (array $selection) use ($project, $run, $previous): ?array {
-                $artifact = collect($this->artifacts($project, $run, $previous))->firstWhere('id', $selection['artifact_id']);
-
-                return $artifact ? $artifact + ['selection' => $selection] : null;
-            })
-            ->filter()
-            ->values()
-            ->all();
-    }
-
-    /** @return list<array<string, mixed>> */
-    private function selectedArtifacts(string $project, string $run, string $phase): array
-    {
-        $directory = "{$this->runPath($project, $run)}/selections/{$phase}";
-
-        if (! File::isDirectory($directory)) {
+        $state = $this->selectionState($project, $run, $previous);
+        if (! $state['complete']) {
             return [];
         }
 
-        return collect(File::files($directory))
-            ->filter(fn (\SplFileInfo $file): bool => $file->getExtension() === 'md')
-            ->map(fn (\SplFileInfo $file): array => MarkdownDocument::read($file->getPathname())['metadata'])
-            ->sortByDesc('created_at')
-            ->unique('slot')
-            ->values()
-            ->all();
+        return array_map(
+            fn (array $item): array => $item['artifact'] + ['selection' => $item['selection']],
+            $state['resolved'],
+        );
+    }
+
+    /** @return list<array<string, mixed>> */
+    private function selectionRecords(string $project, string $run, string $phase): array
+    {
+        return $this->store->selectionRecords($project, $run, $phase);
+    }
+
+    /** @return list<string> */
+    private function requiredSlots(string $project, string $run, string $phase): array
+    {
+        $definition = $this->phases()[$phase];
+        if (($definition['selection_mode'] ?? 'single') !== 'script_shots') {
+            $configured = is_array($definition['slots'] ?? null) ? $definition['slots'] : [];
+
+            return array_values(array_filter(
+                $configured,
+                fn (mixed $slot): bool => is_string($slot) && $slot !== '',
+            ));
+        }
+
+        $shotPlan = $this->effectiveShotPlan($project, $run);
+        if (! $shotPlan['valid'] || ! is_array($shotPlan['shot_plan'])) {
+            return [];
+        }
+
+        $shots = is_array($shotPlan['shot_plan']['shots'] ?? null)
+            ? $shotPlan['shot_plan']['shots']
+            : [];
+
+        return array_values(array_filter(array_map(
+            fn (mixed $shot): string => is_array($shot) && is_string($shot['id'] ?? null)
+                ? $shot['id']
+                : '',
+            $shots,
+        )));
+    }
+
+    /**
+     * @return array{valid: bool, shot_plan: array<string, mixed>|null, errors: list<string>, warnings: list<string>, origin: 'metadata'|'legacy_markdown'|null}
+     */
+    private function effectiveShotPlan(string $project, string $run): array
+    {
+        $scriptState = $this->selectionState($project, $run, 'brief-script');
+        $script = $scriptState['resolved'][0]['artifact'] ?? null;
+
+        if (! $scriptState['complete'] || ! is_array($script)) {
+            return [
+                'valid' => false,
+                'shot_plan' => null,
+                'errors' => ['A valid selected brief/script is required to resolve the shot plan.'],
+                'warnings' => [],
+                'origin' => null,
+            ];
+        }
+
+        return $this->shotPlanResolver->resolve($script);
+    }
+
+    /** @return array<string, array<string, mixed>> */
+    private function expectedShotsBySlot(string $project, string $run, string $phase): array
+    {
+        if (! in_array($phase, ['images', 'scenes'], true)) {
+            return [];
+        }
+
+        $resolution = $this->effectiveShotPlan($project, $run);
+        if (! $resolution['valid'] || ! is_array($resolution['shot_plan'])) {
+            return [];
+        }
+
+        $shots = $resolution['shot_plan']['shots'] ?? null;
+        if (! is_array($shots)) {
+            return [];
+        }
+
+        $bySlot = [];
+        foreach ($shots as $shot) {
+            if (! is_array($shot) || ! is_string($shot['id'] ?? null)) {
+                continue;
+            }
+
+            $bySlot[$shot['id']] = $shot;
+        }
+
+        return $bySlot;
+    }
+
+    /** @return array{resolved: list<array{selection: array<string, mixed>, artifact: array<string, mixed>}>, effective: list<array<string, mixed>>, invalid: list<array{selection: array<string, mixed>, errors: list<string>}>, complete: bool, has_records: bool} */
+    private function selectionState(string $project, string $run, string $phase): array
+    {
+        $expected = $this->expectedSources($project, $run, $phase);
+
+        return $this->selectionResolver->resolve(
+            $phase,
+            $this->selectionRecords($project, $run, $phase),
+            $this->artifacts($project, $run, $phase),
+            $this->requiredSlots($project, $run, $phase),
+            $expected['by_slot'],
+            $expected['ready'],
+            $this->expectedShotsBySlot($project, $run, $phase),
+            $project,
+            $run,
+            $this->expectedSequencePlan($project, $run, $phase),
+        );
+    }
+
+    /** @return array<string, mixed>|null */
+    private function expectedSequencePlan(string $project, string $run, string $phase): ?array
+    {
+        if ($phase !== 'sequence') {
+            return null;
+        }
+
+        $sceneState = $this->selectionState($project, $run, 'scenes');
+        if (! $sceneState['complete']) {
+            return null;
+        }
+
+        $scenes = array_map(
+            static fn (array $item): array => $item['artifact'],
+            $sceneState['resolved'],
+        );
+        $contract = $this->shotPlanResolver->sequenceContract($scenes);
+
+        return $contract['valid'] && is_array($contract['shot_plan'])
+            ? $contract['shot_plan']
+            : null;
+    }
+
+    /** @return array{ready: bool, by_slot: array<string, list<string>>} */
+    private function expectedSources(string $project, string $run, string $phase): array
+    {
+        $slots = $this->requiredSlots($project, $run, $phase);
+        if ($phase === 'ideas') {
+            return ['ready' => true, 'by_slot' => ['primary' => [$project]]];
+        }
+
+        if ($phase === 'concepts') {
+            $source = $this->effectiveIdeaSource($project, $run);
+            if (! $source['explicit']) {
+                return ['ready' => false, 'by_slot' => ['primary' => []]];
+            }
+
+            if ($source['mode'] === 'project_idea') {
+                return ['ready' => true, 'by_slot' => ['primary' => [$project]]];
+            }
+
+            return ['ready' => true, 'by_slot' => ['primary' => [(string) $source['source_id']]]];
+        }
+
+        if (($this->phases()[$phase]['selection_mode'] ?? 'single') === 'script_shots' && $slots === []) {
+            return ['ready' => false, 'by_slot' => []];
+        }
+
+        $previous = $this->previousPhase($phase);
+        if ($previous === null) {
+            return ['ready' => false, 'by_slot' => []];
+        }
+
+        $previousState = $this->selectionState($project, $run, $previous);
+        if (! $previousState['complete']) {
+            return [
+                'ready' => false,
+                'by_slot' => array_fill_keys($slots, []),
+            ];
+        }
+
+        if ($phase === 'scenes') {
+            $bySlot = [];
+            foreach ($previousState['resolved'] as $item) {
+                $bySlot[(string) $item['artifact']['slot']] = [(string) $item['artifact']['id']];
+            }
+
+            return ['ready' => true, 'by_slot' => $bySlot];
+        }
+
+        $sourceIds = array_map(
+            fn (array $item): string => (string) $item['artifact']['id'],
+            $previousState['resolved'],
+        );
+
+        return [
+            'ready' => true,
+            'by_slot' => array_fill_keys($slots, $sourceIds),
+        ];
     }
 
     /** @return list<array<string, mixed>> */
     private function phaseItems(string $project, string $run, string $activePhase): array
     {
-        return collect($this->phases())->map(function (array $definition, string $key) use ($project, $run, $activePhase): array {
-            $selectedCount = count($this->selectedArtifacts($project, $run, $key));
-            $requiredCount = count($definition['slots']);
+        return array_values(collect($this->phases())->map(function (array $definition, string $key) use ($project, $run, $activePhase): array {
+            $state = $this->selectionState($project, $run, $key);
+            $ideaSource = $key === 'ideas'
+                ? $this->effectiveIdeaSource($project, $run)
+                : null;
+            $skipped = $key === 'ideas'
+                && is_array($ideaSource)
+                && $ideaSource['explicit']
+                && $ideaSource['skipped'];
+            $selectedCount = count($state['resolved']);
+            $requiredCount = count($this->requiredSlots($project, $run, $key));
+            $available = $this->expectedSources($project, $run, $key)['ready'];
+            $complete = $key === 'ideas'
+                ? $this->ideasPhaseComplete($state, $ideaSource)
+                : $state['complete'];
 
             return $definition + [
                 'key' => $key,
-                'directory' => $this->phaseDirectory($key),
+                'directory' => $this->phaseCatalog->directory($key),
                 'artifact_count' => count($this->artifacts($project, $run, $key)),
                 'selected_count' => $selectedCount,
                 'required_count' => $requiredCount,
-                'complete' => $selectedCount >= $requiredCount,
+                'required_slots' => $this->requiredSlots($project, $run, $key),
+                'complete' => $complete,
                 'active' => $key === $activePhase,
-                'available' => $key === 'ideas' || $key === 'concepts' || $this->inputs($project, $run, $key) !== [],
+                'available' => $available,
+                'selection_issue_count' => count($state['invalid']),
+                'status' => $skipped
+                    ? 'skipped'
+                    : ($complete
+                    ? 'complete'
+                    : ($state['has_records'] ? 'stale' : ($available ? 'ready' : 'blocked'))),
             ];
-        })->values()->all();
+        })->values()->all());
     }
 
-    /** @return array{current: list<array{title: string, content: string}>, cycle: list<array{title: string, content: string}>, history_count: int} */
+    /**
+     * @return array{
+     *     current: list<array{title: string, content: string}>,
+     *     cycle: list<array{title: string, content: string}>,
+     *     history: list<array<string, mixed>>,
+     *     history_count: int
+     * }
+     */
     private function feedback(string $project, string $run, string $phase): array
     {
-        $history = "{$this->runPath($project, $run)}/feedback/history";
+        return $this->store->feedback($project, $run, $phase);
+    }
+
+    /**
+     * @param  array<string, mixed>  $selectionState
+     * @param  array<string, mixed>|null  $source
+     */
+    private function ideasPhaseComplete(array $selectionState, ?array $source): bool
+    {
+        if (! is_array($source) || ! ($source['explicit'] ?? false)) {
+            return false;
+        }
+
+        if (($source['mode'] ?? null) === 'project_idea') {
+            return (bool) ($source['skipped'] ?? false);
+        }
+
+        return ($source['mode'] ?? null) === 'selected_idea'
+            && (bool) ($selectionState['complete'] ?? false);
+    }
+
+    /**
+     * @return array{
+     *     mode: 'selected_idea'|'project_idea',
+     *     source_id: string,
+     *     source_title: string,
+     *     explicit: bool,
+     *     skipped: bool,
+     *     reason: string|null,
+     *     decision: array<string, mixed>|null
+     * }
+     */
+    public function effectiveIdeaSource(string $project, string $run): array
+    {
+        $ideaState = $this->selectionState($project, $run, 'ideas');
+        $selection = is_array($ideaState['resolved'][0]['selection'] ?? null)
+            ? $ideaState['resolved'][0]['selection']
+            : null;
+        $artifact = is_array($ideaState['resolved'][0]['artifact'] ?? null)
+            ? $ideaState['resolved'][0]['artifact']
+            : null;
+        $latest = collect($this->store->ideaSourceDecisions($project, $run))
+            ->filter(fn (array $record): bool => $this->isValidIdeaSourceDecision($record, $project))
+            ->sortByDesc(fn (array $record): int => (int) ($record['sequence'] ?? 0))
+            ->first();
+
+        if (is_array($latest) && ($latest['mode'] ?? null) === 'project_idea') {
+            if (! $ideaState['complete']
+                || ! is_array($selection)
+                || $this->ideaDecisionIsAtOrAfterSelection($latest, $selection)) {
+                return [
+                    'mode' => 'project_idea',
+                    'source_id' => $project,
+                    'source_title' => 'Broad project idea',
+                    'explicit' => true,
+                    'skipped' => true,
+                    'reason' => is_string($latest['reason'] ?? null) ? $latest['reason'] : null,
+                    'decision' => $latest,
+                ];
+            }
+        }
+
+        if ($ideaState['complete'] && is_array($artifact)) {
+            $matchingDecision = is_array($latest)
+                && ($latest['mode'] ?? null) === 'selected_idea'
+                && ($latest['artifact_id'] ?? null) === ($artifact['id'] ?? null)
+                && ($latest['selection_id'] ?? null) === ($selection['id'] ?? null);
+
+            return [
+                'mode' => 'selected_idea',
+                'source_id' => (string) $artifact['id'],
+                'source_title' => (string) ($artifact['title'] ?? 'Selected idea'),
+                'explicit' => $matchingDecision,
+                'skipped' => false,
+                'reason' => is_string(($matchingDecision ? $latest : $selection)['reason'] ?? null)
+                    ? ($matchingDecision ? $latest : $selection)['reason']
+                    : null,
+                'decision' => $matchingDecision ? $latest : null,
+            ];
+        }
 
         return [
-            'current' => MarkdownDocument::read($this->currentFeedbackPath($project, $run, $phase))['sections'],
-            'cycle' => MarkdownDocument::read($this->cycleFeedbackPath($project, $run))['sections'],
-            'history_count' => File::isDirectory($history) ? count(File::files($history)) : 0,
+            'mode' => 'project_idea',
+            'source_id' => $project,
+            'source_title' => 'Broad project idea',
+            'explicit' => false,
+            'skipped' => false,
+            'reason' => null,
+            'decision' => null,
         ];
+    }
+
+    private function recordIdeaSourceDecision(
+        string $project,
+        string $run,
+        string $mode,
+        string $selectedBy,
+        string $reason,
+        ?string $artifactId = null,
+        ?string $selectionId = null,
+    ): void {
+        $decision = $this->ideaSourceDecisionDocument(
+            $project,
+            $mode,
+            $selectedBy,
+            $reason,
+            $artifactId,
+            $selectionId,
+        );
+        $this->store->appendIdeaSourceDecision(
+            $project,
+            $run,
+            $decision['id'],
+            $decision['metadata'],
+            $decision['body'],
+        );
+    }
+
+    /**
+     * @return array{id: string, metadata: array<string, mixed>, body: string}
+     */
+    private function ideaSourceDecisionDocument(
+        string $project,
+        string $mode,
+        string $selectedBy,
+        string $reason,
+        ?string $artifactId = null,
+        ?string $selectionId = null,
+        ?string $createdAt = null,
+    ): array {
+        $decisionId = $this->filename('ideas-source', $mode);
+        $sourceId = $mode === 'selected_idea' && $artifactId !== null ? $artifactId : $project;
+
+        return [
+            'id' => $decisionId,
+            'metadata' => [
+                'schema_version' => 1,
+                'id' => $decisionId,
+                'type' => 'ideas_source_decision',
+                'phase' => 'ideas',
+                'mode' => $mode,
+                'source_id' => $sourceId,
+                'artifact_id' => $artifactId,
+                'selection_id' => $selectionId,
+                'selected_by' => $selectedBy,
+                'reason' => $reason,
+                'created_at' => $createdAt ?? $this->timestamp(),
+            ],
+            'body' => "# Ideas source decision\n\n## Decision\n\n".($mode === 'selected_idea'
+                ? "Use selected idea `{$artifactId}` as the Concepts source."
+                : 'Skip optional Ideas and use the broad idea from `project.md` as the Concepts source.')."\n\n## Reason\n\n{$reason}",
+        ];
+    }
+
+    /** @param array<string, mixed> $record */
+    private function isValidIdeaSourceDecision(array $record, string $project): bool
+    {
+        $mode = $record['mode'] ?? null;
+        $sourceId = $record['source_id'] ?? null;
+        $artifactId = $record['artifact_id'] ?? null;
+        $selectionId = $record['selection_id'] ?? null;
+        $lineageSequence = $record['lineage_sequence'] ?? null;
+
+        if (($record['schema_version'] ?? null) !== 1
+            || ! is_string($record['id'] ?? null)
+            || trim($record['id']) === ''
+            || ($record['type'] ?? null) !== 'ideas_source_decision'
+            || ($record['phase'] ?? null) !== 'ideas'
+            || ! in_array($mode, ['selected_idea', 'project_idea'], true)
+            || ! is_string($sourceId)
+            || trim($sourceId) === ''
+            || ! in_array($record['selected_by'] ?? null, ['human', 'automation'], true)
+            || ! is_string($record['reason'] ?? null)
+            || trim($record['reason']) === ''
+            || ! $this->isIsoTimestamp($record['created_at'] ?? null)
+            || ! is_int($record['sequence'] ?? null)
+            || $record['sequence'] < 1
+            || ($lineageSequence !== null
+                && (! is_int($lineageSequence) || $lineageSequence < 1))) {
+            return false;
+        }
+
+        if ($mode === 'project_idea') {
+            return $sourceId === $project && $artifactId === null && $selectionId === null;
+        }
+
+        return is_string($artifactId)
+            && trim($artifactId) !== ''
+            && $sourceId === $artifactId
+            && is_string($selectionId)
+            && trim($selectionId) !== '';
+    }
+
+    /**
+     * @param  array<string, mixed>  $decision
+     * @param  array<string, mixed>  $selection
+     */
+    private function ideaDecisionIsAtOrAfterSelection(array $decision, array $selection): bool
+    {
+        $decisionSequence = $decision['lineage_sequence'] ?? null;
+        $selectionSequence = $selection['lineage_sequence'] ?? null;
+        if (is_int($decisionSequence)
+            && $decisionSequence > 0
+            && is_int($selectionSequence)
+            && $selectionSequence > 0) {
+            return $decisionSequence >= $selectionSequence;
+        }
+
+        $decisionCreatedAt = is_string($decision['created_at'] ?? null)
+            ? $decision['created_at']
+            : '';
+        $selectionCreatedAt = is_string($selection['created_at'] ?? null)
+            ? $selection['created_at']
+            : '';
+
+        return $decisionCreatedAt === ''
+            || $selectionCreatedAt === ''
+            || $decisionCreatedAt >= $selectionCreatedAt;
+    }
+
+    private function isIsoTimestamp(mixed $value): bool
+    {
+        if (! is_string($value)
+            || preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/', $value) !== 1) {
+            return false;
+        }
+
+        try {
+            new \DateTimeImmutable($value);
+
+            return true;
+        } catch (Throwable) {
+            return false;
+        }
     }
 
     /** @return list<array<string, mixed>> */
     private function runs(string $project): array
     {
-        $directory = "{$this->projectPath($project)}/runs";
-
-        return collect(File::directories($directory))
-            ->map(function (string $path): array {
-                $document = $this->readDocument("{$path}/run.md");
-
-                return [
-                    'id' => basename($path),
-                    'created_at' => $document['metadata']['created_at'] ?? '',
-                    'label' => 'Run '.substr(basename($path), 0, 8),
-                ];
-            })
-            ->sortByDesc('created_at')
-            ->values()
-            ->all();
+        return $this->store->runs($project);
     }
 
     /** @return array<string, mixed>|null */
     private function projectSummary(string $project): ?array
     {
         try {
-            $document = $this->readDocument("{$this->projectPath($project)}/project.md");
+            $document = $this->store->readProject($project);
             $runs = $this->runs($project);
             $latestRun = $runs[0]['id'] ?? null;
 
@@ -381,213 +1088,102 @@ final class CreativeWorkspaceRepository
                 'latest_run' => $latestRun,
                 'current_phase' => $current['key'] ?? 'concepts',
             ];
-        } catch (RuntimeException) {
+        } catch (Throwable) {
             return null;
         }
     }
 
-    /** @return list<array{name: string, path: string, type: string, children?: array}> */
-    private function tree(string $directory, string $base, int $depth = 0): array
+    /** @return array{configured_driver: string, effective_driver: string, label: string, external: bool, cost: string, description: string} */
+    private function generationState(string $phase): array
     {
-        if ($depth > 5) {
-            return [];
-        }
-
-        return collect(File::directories($directory))
-            ->map(fn (string $path): array => [
-                'name' => basename($path),
-                'path' => Str::after($path, $base.'/'),
-                'type' => 'directory',
-                'children' => $this->tree($path, $base, $depth + 1),
-            ])
-            ->concat(collect(File::files($directory))->map(fn (\SplFileInfo $file): array => [
-                'name' => $file->getFilename(),
-                'path' => Str::after($file->getPathname(), $base.'/'),
-                'type' => $file->getExtension() === 'md' ? 'markdown' : 'asset',
-            ]))
-            ->sortBy(fn (array $item): string => ($item['type'] === 'directory' ? '0' : '1').$item['name'])
-            ->values()
-            ->all();
+        return $this->generation->state($phase);
     }
 
-    /** @param list<array{title: string, summary: string, body: string}> $options */
-    private function writeTextOptions(string $project, string $run, string $phase, array $options): void
+    private function generationFeedback(string $project, string $run, string $phase): string
     {
-        foreach ($options as $option) {
-            $id = $this->filename($phase, $option['title']);
-            MarkdownDocument::write("{$this->runPath($project, $run)}/{$this->phaseDirectory($phase)}/outputs/{$id}.md", [
-                'id' => $id,
-                'artifact_type' => 'markdown',
-                'phase' => $phase,
-                'slot' => 'primary',
-                'title' => $option['title'],
-                'summary' => $option['summary'],
-                'created_at' => now('UTC')->toIso8601String(),
-                'version' => 1,
-                'simulation' => true,
-            ], $option['body']);
-        }
-    }
+        $feedback = $this->feedback($project, $run, $phase);
 
-    private function writeImageOptions(string $project, string $run): void
-    {
-        $shots = [
-            ['shot-01', 'Hook', 'Three identical “Hey :)” messages stack on Mara’s phone.', '#d97851'],
-            ['shot-02', 'Friction', 'Mara pauses over another generic reply and closes the chat.', '#9b8572'],
-            ['shot-03', 'Product', 'The approved voice-prompt interface appears clearly.', '#557c70'],
-            ['shot-04', 'Payoff', 'A playful voice answer creates a genuine smile.', '#c59562'],
-            ['shot-05', 'CTA', 'Warm brand end card: Start with something real.', '#24433f'],
-        ];
-
-        foreach ($shots as [$slot, $purpose, $description, $color]) {
-            foreach (['A', 'B'] as $variant) {
-                $title = Str::headline($slot)." · {$purpose} · {$variant}";
-                $id = $this->filename('keyframe', "{$slot}-{$variant}");
-                MarkdownDocument::write("{$this->runPath($project, $run)}/03-images/outputs/{$id}.md", [
-                    'id' => $id,
-                    'artifact_type' => 'image_sidecar',
-                    'phase' => 'images',
-                    'slot' => $slot,
-                    'variant' => $variant,
-                    'title' => $title,
-                    'summary' => $description,
-                    'asset_path' => "assets/{$id}.png",
-                    'preview_color' => $variant === 'A' ? $color : '#b6a38f',
-                    'created_at' => now('UTC')->toIso8601String(),
-                    'simulation' => true,
-                ], "# {$title}\n\n## Visual\n\n{$description}\n\n## Direction\n\nPortrait 9:16, emotionally readable, natural skin texture, simple composition.\n\n## Generation prompt\n\nA realistic advertisement keyframe with clear human emotion and no generated product text.\n\n## Asset status\n\nInterface prototype only. The future image provider will write the binary file referenced in the front matter.");
+        return collect([
+            'Phase feedback' => $feedback['current'],
+            'Whole-run feedback' => $feedback['cycle'],
+        ])->map(function (array $sections, string $label): string {
+            if ($sections === []) {
+                return '';
             }
-        }
-    }
 
-    private function writeSceneOptions(string $project, string $run): void
-    {
-        foreach ($this->phases()['scenes']['slots'] as $index => $slot) {
-            $title = Str::headline($slot).' · '.($index + 1).'-second clip';
-            $id = $this->filename('scene', $slot);
-            MarkdownDocument::write("{$this->runPath($project, $run)}/04-scenes/outputs/{$id}.md", [
-                'id' => $id,
-                'artifact_type' => 'video_sidecar',
-                'phase' => 'scenes',
-                'slot' => $slot,
-                'title' => $title,
-                'summary' => 'Short scene derived from the selected keyframe.',
-                'asset_path' => "assets/{$id}.mp4",
-                'preview_color' => ['#d97851', '#9b8572', '#557c70', '#c59562', '#24433f'][$index],
-                'created_at' => now('UTC')->toIso8601String(),
-                'simulation' => true,
-            ], "# {$title}\n\n## Motion\n\nOne clear action, subtle camera movement and consistent character identity.\n\n## Duration\n\nBetween 1 and 3 seconds.\n\n## Asset status\n\nInterface prototype only. Seedance integration will write the referenced MP4 later.");
-        }
-    }
-
-    /** @return list<array{title: string, summary: string, body: string}> */
-    private function ideaOptions(): array
-    {
-        return [
-            ['title' => 'Same opener, again', 'summary' => 'Repetition becomes the recognizable hook.', 'body' => "# Same opener, again\n\n## Idea\n\nThree conversations begin with the same generic message. A voice prompt creates the first moment that feels human."],
-            ['title' => 'Type. Delete. Repeat.', 'summary' => 'First-message anxiety becomes playful momentum.', 'body' => "# Type. Delete. Repeat.\n\n## Idea\n\nA user repeatedly types and deletes an opener until a conversation card gives them something real to say."],
-            ['title' => 'More than a photo', 'summary' => 'A human voice reveals what a profile grid cannot.', 'body' => "# More than a photo\n\n## Idea\n\nA polished profile feels distant until a funny voice answer reveals the person behind it."],
-        ];
-    }
-
-    /** @return list<array{title: string, summary: string, body: string}> */
-    private function conceptOptions(): array
-    {
-        return [
-            ['title' => 'The fourth “Hey”', 'summary' => 'Generic repetition turns into real curiosity.', 'body' => "# The fourth “Hey”\n\n## Hook\n\nThree identical messages arrive in rapid succession.\n\n## Emotional turn\n\nSameness → curiosity.\n\n## Product mechanism\n\nA playful voice prompt creates a distinctive opening.\n\n## What this tests\n\nWhether a highly recognizable micro-moment improves immediate attention."],
-            ['title' => 'The deleted opener', 'summary' => 'Awkward typing gives way to an easy prompt.', 'body' => "# The deleted opener\n\n## Hook\n\nA thumb types and erases the same sentence three times.\n\n## Emotional turn\n\nFriction → playfulness.\n\n## Product mechanism\n\nConversation cards make the first message easier.\n\n## What this tests\n\nWhether visible first-message tension creates recognition."],
-            ['title' => 'Hear the difference', 'summary' => 'A voice answer creates instant personality.', 'body' => "# Hear the difference\n\n## Hook\n\nA silent profile montage suddenly stops on one expressive voice answer.\n\n## Emotional turn\n\nDistance → recognition.\n\n## Product mechanism\n\nVoice prompts reveal personality before a match.\n\n## What this tests\n\nWhether the product demonstration can serve as the hook itself."],
-        ];
-    }
-
-    /** @return list<array{title: string, summary: string, body: string}> */
-    private function scriptOptions(): array
-    {
-        return [
-            ['title' => 'Start with something real', 'summary' => 'A clear five-shot story built around repeated openers.', 'body' => "# Start with something real\n\n## Purpose\n\nShow that voice prompts help conversations begin with personality instead of repetition.\n\n## Audience\n\nThoughtful urban daters aged 25–38 who are tired of generic small talk.\n\n## Story\n\nMara sees the same opener three times, discovers a funny voice prompt, and responds with genuine curiosity.\n\n## 15-second script\n\n**0.0–1.5s — Hook**  \nThree “Hey :)” messages stack. Caption: *When every chat starts the same…*\n\n**1.5–4.0s — Friction**  \nMara exhales and closes the chat.\n\n**4.0–8.0s — Product**  \nA voice prompt appears: *My most irrational opinion is…* A playful answer begins.\n\n**8.0–12.0s — Payoff**  \nMara smiles and sends a real response.\n\n**12.0–15.0s — CTA**  \nLogo and line: *Start with something real.*"],
-            ['title' => 'Delete the small talk', 'summary' => 'Typing tension resolves through a conversation card.', 'body' => "# Delete the small talk\n\n## Purpose\n\nMake the first-message problem visible and resolve it simply.\n\n## Audience\n\nDaters who want to connect but overthink how to begin.\n\n## Story\n\nA typed opener is deleted three times before the app supplies a specific playful prompt.\n\n## 15-second script\n\n**0.0–3.0s** Type. Delete. Type. Delete.\n\n**3.0–7.0s** A conversation card appears.\n\n**7.0–12.0s** The recipient laughs and replies.\n\n**12.0–15.0s** *Skip the small talk. Try Example Dating.*"],
-            ['title' => 'A profile you can hear', 'summary' => 'The product demonstration becomes the emotional hook.', 'body' => "# A profile you can hear\n\n## Purpose\n\nDemonstrate personality before conversation.\n\n## Audience\n\nPeople who find photo-first profiles emotionally flat.\n\n## Story\n\nA fast profile grid stops when one funny voice answer changes the viewer’s expression.\n\n## 15-second script\n\n**0.0–2.0s** Profiles move past quickly.\n\n**2.0–7.0s** One voice answer plays.\n\n**7.0–12.0s** A genuine smile and meaningful reply.\n\n**12.0–15.0s** *More than a photo. Start with something real.*"],
-        ];
-    }
-
-    /** @return list<array{title: string, summary: string, body: string}> */
-    private function sequenceOptions(): array
-    {
-        return [
-            ['title' => 'Direct story cut', 'summary' => 'Clean chronological assembly with restrained captions.', 'body' => "# Direct story cut\n\n## Order\n\n1. Hook notification stack\n2. Human reaction\n3. Product mechanism\n4. Emotional payoff\n5. Brand CTA\n\n## Editor notes\n\nHard cuts for the first four seconds, then slightly warmer pacing. Keep the product UI deterministic."],
-            ['title' => 'Caption-led cut', 'summary' => 'On-screen copy carries the story without sound.', 'body' => "# Caption-led cut\n\n## Order\n\nUse the same five scenes with captions as the narrative spine.\n\n## Editor notes\n\nPrioritize silent comprehension, large safe-zone captions and one restrained sound cue per transition."],
-            ['title' => 'Product-forward cut', 'summary' => 'Move the voice prompt earlier for a faster demonstration.', 'body' => "# Product-forward cut\n\n## Order\n\nHook → product insert → reaction → reply → CTA.\n\n## Editor notes\n\nReveal the mechanism by second four and preserve at least three seconds for the human payoff."],
-        ];
+            return '# '.$label."\n\n".collect($sections)
+                ->map(fn (array $section): string => "## {$section['title']}\n\n{$section['content']}")
+                ->implode("\n\n");
+        })->filter()->implode("\n\n");
     }
 
     /** @return array<string, array<string, mixed>> */
     private function phases(): array
     {
-        return config('creative.phases');
-    }
-
-    private function phaseDirectory(string $phase): string
-    {
-        return $this->phases()[$phase]['number'].'-'.$phase;
+        return $this->phaseCatalog->all();
     }
 
     private function nextPhase(string $phase): ?string
     {
-        $keys = array_keys($this->phases());
-        $index = array_search($phase, $keys, true);
-
-        return is_int($index) && isset($keys[$index + 1]) ? $keys[$index + 1] : null;
+        return $this->phaseCatalog->next($phase);
     }
 
     private function previousPhase(string $phase): ?string
     {
-        $keys = array_keys($this->phases());
-        $index = array_search($phase, $keys, true);
-
-        return is_int($index) && $index > 0 ? $keys[$index - 1] : null;
-    }
-
-    /** @return array<string, mixed> */
-    private function readDocument(string $path): array
-    {
-        if (! File::isFile($path)) {
-            throw new RuntimeException('Creative document not found: '.basename($path));
-        }
-
-        return MarkdownDocument::read($path);
-    }
-
-    private function root(): string
-    {
-        return rtrim((string) config('creative.root'), '/');
-    }
-
-    private function projectPath(string $project): string
-    {
-        $this->assertIdentifier($project);
-
-        return $this->root().'/'.$project;
-    }
-
-    private function runPath(string $project, string $run): string
-    {
-        $this->assertIdentifier($run);
-
-        return $this->projectPath($project).'/runs/'.$run;
-    }
-
-    private function assertIdentifier(string $identifier): void
-    {
-        if (preg_match('/^[a-z0-9][a-z0-9-]*--[a-z0-9]+$/', $identifier) !== 1) {
-            throw new RuntimeException('Invalid creative workspace identifier.');
-        }
+        return $this->phaseCatalog->previous($phase);
     }
 
     private function assertPhase(string $phase): void
     {
-        if (! array_key_exists($phase, $this->phases())) {
-            throw new RuntimeException('Invalid creative phase.');
-        }
+        $this->phaseCatalog->assertValid($phase);
+    }
+
+    /**
+     * @param  array<string, mixed>  $artifact
+     * @param  list<string>|null  $expectedSourceIds
+     * @param  list<string>  $requiredSlots
+     * @param  array<string, mixed>|null  $expectedShot
+     * @param  array<string, list<string>>  $expectedSourcesBySlot
+     * @param  array<string, array<string, mixed>>  $expectedShotsBySlot
+     * @return array{valid: bool, errors: list<string>, warnings: list<string>, schema_version: int|null}
+     */
+    private function artifactValidation(
+        string $project,
+        string $run,
+        array $artifact,
+        string $phase,
+        ?array $expectedSourceIds,
+        array $requiredSlots,
+        ?array $expectedShot,
+        array $expectedSourcesBySlot,
+        array $expectedShotsBySlot,
+    ): array {
+        $expectedSequencePlan = $this->expectedSequencePlan($project, $run, $phase);
+        $validation = $this->artifactValidator->validate(
+            $artifact,
+            $phase,
+            $expectedSourceIds,
+            $requiredSlots,
+            $expectedShot,
+            $expectedSequencePlan,
+        );
+        $eligibility = $this->artifactEligibility->verify(
+            $project,
+            $run,
+            $phase,
+            $artifact,
+            $requiredSlots,
+            $expectedSourcesBySlot,
+            $expectedShotsBySlot,
+            $expectedSequencePlan,
+        );
+
+        return [
+            'valid' => $validation['valid'] && $eligibility['eligible'],
+            'errors' => array_values(array_unique(array_merge($validation['errors'], $eligibility['errors']))),
+            'warnings' => array_values(array_unique(array_merge($validation['warnings'], $eligibility['warnings']))),
+            'schema_version' => $validation['schema_version'],
+        ];
     }
 
     private function shortId(): string
@@ -600,32 +1196,8 @@ final class CreativeWorkspaceRepository
         return now('UTC')->format('Ymd-His').'--'.Str::slug($type).'--'.$this->shortId().'--'.Str::limit(Str::slug($title), 42, '');
     }
 
-    private function currentFeedbackPath(string $project, string $run, string $phase): string
+    private function timestamp(): string
     {
-        return "{$this->runPath($project, $run)}/feedback/current/phase-{$phase}.md";
-    }
-
-    private function cycleFeedbackPath(string $project, string $run): string
-    {
-        return "{$this->runPath($project, $run)}/feedback/current/cycle.md";
-    }
-
-    private function writeCurrentFeedback(string $project, string $run, string $phase, string $body): void
-    {
-        MarkdownDocument::write($this->currentFeedbackPath($project, $run, $phase), [
-            'type' => 'feedback_inbox',
-            'scope' => 'phase',
-            'phase' => $phase,
-            'updated_at' => now('UTC')->toIso8601String(),
-        ], "# Current feedback · {$phase}\n\n{$body}");
-    }
-
-    private function writeCycleFeedback(string $project, string $run, string $body): void
-    {
-        MarkdownDocument::write($this->cycleFeedbackPath($project, $run), [
-            'type' => 'feedback_inbox',
-            'scope' => 'cycle',
-            'updated_at' => now('UTC')->toIso8601String(),
-        ], "# Current feedback · whole cycle\n\n{$body}");
+        return now('UTC')->format('Y-m-d\TH:i:s.uP');
     }
 }

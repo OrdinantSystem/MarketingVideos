@@ -1,5 +1,7 @@
 # VideoAuto — Laravel Technical Handoff
 
+> **Historical architecture note:** This document predates the current filesystem-first creative workspace and contains broader database/service recommendations that are not implemented in the prototype. For the canonical current behavior and roadmap, read [`docs/CREATIVE_PRODUCTION_SYSTEM.md`](docs/CREATIVE_PRODUCTION_SYSTEM.md).
+
 **Document status:** Architecture and implementation handoff  
 **Project:** Automated production and experimentation system for 15-second dating-app advertisements  
 **Primary application framework:** Laravel 13  
@@ -158,47 +160,47 @@ The rendering service is separate because Remotion is a Node.js tool and video r
 
 ## 5. Recommended technology stack
 
-| Layer | Technology | Responsibility |
-|---|---|---|
-| Backend framework | Laravel 13, PHP 8.3+ | Business logic, API, workflow, authorization |
-| AI abstraction | Laravel AI SDK | Structured agents, tools, images, TTS, STT, embeddings |
-| Frontend | Inertia 3, React 19, TypeScript | Interactive production dashboard |
-| UI | Tailwind 4, shadcn/ui | Reusable interface components |
-| Database | PostgreSQL | Transactional data, versions, experiments, audit trail |
-| Flexible data | PostgreSQL JSONB | Briefs, concepts, storyboards, review payloads |
-| Semantic retrieval later | PostgreSQL + pgvector | Retrieve relevant previous learnings and examples |
-| Queue broker | Redis | Background job transport, locks, cache |
-| Queue dashboard | Laravel Horizon | Queue throughput, failures, retries, balancing |
-| Real-time UI | Laravel Reverb | Job progress, render updates, approval notifications |
-| Object storage | S3-compatible private storage | Images, videos, audio, frames, manifests |
-| Local object storage | MinIO | Local-development equivalent of S3 |
-| Renderer | Node.js + Remotion | Data-driven captions, layouts, transitions, end cards |
-| Media tooling | FFmpeg and ffprobe | Cutting, encoding, probing, extracting frames/audio |
-| Local diagnostics | Laravel Telescope | Requests, queries, jobs, exceptions |
-| Production monitoring | Laravel Pulse plus an error tracker | Application and queue health |
-| Authentication | Laravel starter-kit auth; Sanctum for API | Users, sessions, API clients |
-| Testing | Pest/PHPUnit, Laravel AI fakes, Vitest, Playwright | Unit, integration, UI, and workflow testing |
-| Local environment | Docker Compose | Reproducible application stack |
-| CI/CD | GitHub Actions | Tests, static analysis, builds, deployment |
-| Deployment | Laravel Cloud, Forge, or Docker VPS | Production runtime |
+| Layer                    | Technology                                         | Responsibility                                         |
+| ------------------------ | -------------------------------------------------- | ------------------------------------------------------ |
+| Backend framework        | Laravel 13, PHP 8.3+                               | Business logic, API, workflow, authorization           |
+| AI abstraction           | Laravel AI SDK                                     | Structured agents, tools, images, TTS, STT, embeddings |
+| Frontend                 | Inertia 3, React 19, TypeScript                    | Interactive production dashboard                       |
+| UI                       | Tailwind 4, shadcn/ui                              | Reusable interface components                          |
+| Database                 | PostgreSQL                                         | Transactional data, versions, experiments, audit trail |
+| Flexible data            | PostgreSQL JSONB                                   | Briefs, concepts, storyboards, review payloads         |
+| Semantic retrieval later | PostgreSQL + pgvector                              | Retrieve relevant previous learnings and examples      |
+| Queue broker             | Redis                                              | Background job transport, locks, cache                 |
+| Queue dashboard          | Laravel Horizon                                    | Queue throughput, failures, retries, balancing         |
+| Real-time UI             | Laravel Reverb                                     | Job progress, render updates, approval notifications   |
+| Object storage           | S3-compatible private storage                      | Images, videos, audio, frames, manifests               |
+| Local object storage     | MinIO                                              | Local-development equivalent of S3                     |
+| Renderer                 | Node.js + Remotion                                 | Data-driven captions, layouts, transitions, end cards  |
+| Media tooling            | FFmpeg and ffprobe                                 | Cutting, encoding, probing, extracting frames/audio    |
+| Local diagnostics        | Laravel Telescope                                  | Requests, queries, jobs, exceptions                    |
+| Production monitoring    | Laravel Pulse plus an error tracker                | Application and queue health                           |
+| Authentication           | Laravel starter-kit auth; Sanctum for API          | Users, sessions, API clients                           |
+| Testing                  | Pest/PHPUnit, Laravel AI fakes, Vitest, Playwright | Unit, integration, UI, and workflow testing            |
+| Local environment        | Docker Compose                                     | Reproducible application stack                         |
+| CI/CD                    | GitHub Actions                                     | Tests, static analysis, builds, deployment             |
+| Deployment               | Laravel Cloud, Forge, or Docker VPS                | Production runtime                                     |
 
 ### 5.1 Initial AI model routing
 
 Model names must live in configuration, never in business logic. A sensible initial routing policy as of July 2026 is:
 
-| Task | Initial model tier | Reason |
-|---|---|---|
-| Intake cleanup and extraction | GPT-5.6 Luna | High-volume, lower-cost structured work |
-| Tagging and classification | GPT-5.6 Luna | Routine and repeatable |
-| Campaign brief | GPT-5.6 Terra | Balance of reasoning and cost |
-| Creative hypotheses | GPT-5.6 Terra | Strong reasoning without always using frontier cost |
-| Script and storyboard | GPT-5.6 Terra | Complex structure and emotional coherence |
-| Difficult final review | GPT-5.6 Terra or Sol | Strong multimodal reasoning |
-| Rare campaign investigation | GPT-5.6 Sol | Highest-capability analysis |
-| Image generation | Provider benchmark winner | Do not assume one model is permanently best |
-| Video generation | Seedance 2.0 Fast initially | Low-cost scene generation; provider adapter required |
-| Voice | ElevenLabs or OpenAI through Laravel AI SDK | Configurable by campaign |
-| Transcription | OpenAI STT through Laravel AI SDK | Reference-ad analysis and caption alignment |
+| Task                          | Initial model tier                          | Reason                                               |
+| ----------------------------- | ------------------------------------------- | ---------------------------------------------------- |
+| Intake cleanup and extraction | GPT-5.6 Luna                                | High-volume, lower-cost structured work              |
+| Tagging and classification    | GPT-5.6 Luna                                | Routine and repeatable                               |
+| Campaign brief                | GPT-5.6 Terra                               | Balance of reasoning and cost                        |
+| Creative hypotheses           | GPT-5.6 Terra                               | Strong reasoning without always using frontier cost  |
+| Script and storyboard         | GPT-5.6 Terra                               | Complex structure and emotional coherence            |
+| Difficult final review        | GPT-5.6 Terra or Sol                        | Strong multimodal reasoning                          |
+| Rare campaign investigation   | GPT-5.6 Sol                                 | Highest-capability analysis                          |
+| Image generation              | Provider benchmark winner                   | Do not assume one model is permanently best          |
+| Video generation              | Seedance 2.0 Fast initially                 | Low-cost scene generation; provider adapter required |
+| Voice                         | ElevenLabs or OpenAI through Laravel AI SDK | Configurable by campaign                             |
+| Transcription                 | OpenAI STT through Laravel AI SDK           | Reference-ad analysis and caption alignment          |
 
 The system must run an internal benchmark before declaring a default image provider. Test face realism, expression, identity continuity, prompt adherence, cost, latency, and acceptance rate.
 
@@ -338,33 +340,33 @@ Policy review is not a sentence hidden in a prompt.
 
 ## 9. Domain vocabulary
 
-| Term | Meaning |
-|---|---|
-| Workspace | A tenant containing users, brands, campaigns, assets, and billing |
-| Brand | The dating product or client |
-| Brand Profile | Versioned source of truth about the brand and product |
-| Campaign | A business objective and experiment container |
-| Brief | Approved requirements for a campaign |
-| Requirement | A traceable must-have or must-not-have condition |
-| Creative Hypothesis | A testable ad idea, not yet media |
-| Creative Genome | Structured description of the variables in an ad |
-| Concept | Human-readable presentation of a creative hypothesis |
-| Storyboard | Timed shot plan |
-| Shot | One planned visual unit |
-| Continuity Package | Approved references for people, places, wardrobe, UI, and look |
-| Keyframe | Approved still image used to guide a scene |
-| Scene | A generated short video clip |
-| Generation Attempt | One provider request for a defined input version |
-| Render Manifest | Exact data used to assemble a final video |
-| Render | A generated final or preview video |
-| Review | Technical, creative, or policy evaluation |
-| Variant | A campaign-ready ad that tests defined variables |
-| Published Creative | A variant mapped to an external platform ID |
-| Metric Observation | Raw performance data for a published creative |
-| Learning | A conclusion linked to evidence and limitations |
-| Artifact | Any versioned creative object |
-| Artifact Version | Immutable snapshot of an artifact |
-| Lineage | The graph explaining what produced what |
+| Term                | Meaning                                                           |
+| ------------------- | ----------------------------------------------------------------- |
+| Workspace           | A tenant containing users, brands, campaigns, assets, and billing |
+| Brand               | The dating product or client                                      |
+| Brand Profile       | Versioned source of truth about the brand and product             |
+| Campaign            | A business objective and experiment container                     |
+| Brief               | Approved requirements for a campaign                              |
+| Requirement         | A traceable must-have or must-not-have condition                  |
+| Creative Hypothesis | A testable ad idea, not yet media                                 |
+| Creative Genome     | Structured description of the variables in an ad                  |
+| Concept             | Human-readable presentation of a creative hypothesis              |
+| Storyboard          | Timed shot plan                                                   |
+| Shot                | One planned visual unit                                           |
+| Continuity Package  | Approved references for people, places, wardrobe, UI, and look    |
+| Keyframe            | Approved still image used to guide a scene                        |
+| Scene               | A generated short video clip                                      |
+| Generation Attempt  | One provider request for a defined input version                  |
+| Render Manifest     | Exact data used to assemble a final video                         |
+| Render              | A generated final or preview video                                |
+| Review              | Technical, creative, or policy evaluation                         |
+| Variant             | A campaign-ready ad that tests defined variables                  |
+| Published Creative  | A variant mapped to an external platform ID                       |
+| Metric Observation  | Raw performance data for a published creative                     |
+| Learning            | A conclusion linked to evidence and limitations                   |
+| Artifact            | Any versioned creative object                                     |
+| Artifact Version    | Immutable snapshot of an artifact                                 |
+| Lineage             | The graph explaining what produced what                           |
 
 ---
 
@@ -450,27 +452,24 @@ The `BrandProfileAgent` helps convert conversational input into a complete struc
 
 ```json
 {
-  "brand_name": "Example",
-  "markets": ["DE"],
-  "languages": ["de", "en"],
-  "tone": ["warm", "honest", "playful"],
-  "approved_features": [
-    {
-      "id": "FEAT-001",
-      "name": "Voice prompts",
-      "evidence_asset_ids": ["AST-102"]
-    }
-  ],
-  "approved_claims": [],
-  "prohibited_claims": [
-    "Guaranteed relationship",
-    "Perfect compatibility",
-    "Everyone finds a match"
-  ],
-  "cta_options": [
-    "Start with something real",
-    "Try Example"
-  ]
+    "brand_name": "Example",
+    "markets": ["DE"],
+    "languages": ["de", "en"],
+    "tone": ["warm", "honest", "playful"],
+    "approved_features": [
+        {
+            "id": "FEAT-001",
+            "name": "Voice prompts",
+            "evidence_asset_ids": ["AST-102"]
+        }
+    ],
+    "approved_claims": [],
+    "prohibited_claims": [
+        "Guaranteed relationship",
+        "Perfect compatibility",
+        "Everyone finds a match"
+    ],
+    "cta_options": ["Start with something real", "Try Example"]
 }
 ```
 
@@ -523,16 +522,16 @@ Then the `ReferenceAdAnalysisAgent` analyzes this package.
 
 ```json
 {
-  "hook": "Several chats open with the same generic message",
-  "emotion_from": "sameness",
-  "emotion_to": "curiosity",
-  "product_mechanism": "conversation prompts",
-  "story_pattern": "friction-mechanism-reaction",
-  "shots": 6,
-  "cta": "Start with something real",
-  "uncertainties": [
-    "The product feature cannot be verified from the uploaded video alone"
-  ]
+    "hook": "Several chats open with the same generic message",
+    "emotion_from": "sameness",
+    "emotion_to": "curiosity",
+    "product_mechanism": "conversation prompts",
+    "story_pattern": "friction-mechanism-reaction",
+    "shots": 6,
+    "cta": "Start with something real",
+    "uncertainties": [
+        "The product feature cannot be verified from the uploaded video alone"
+    ]
 }
 ```
 
@@ -635,18 +634,18 @@ Every hypothesis stores:
 
 ```json
 {
-  "trigger_moment": "Several conversations begin with generic openers",
-  "emotion_from": "sameness",
-  "emotion_to": "curiosity",
-  "product_mechanism": "voice prompts",
-  "hook_type": "recognizable micro-moment",
-  "story_pattern": "friction-mechanism-reaction",
-  "visual_format": "UGC narrative with product inserts",
-  "pace": "fast opening, warmer payoff",
-  "cta": "Start with something real",
-  "primary_test_variable": "hook situation",
-  "policy_risk": "low",
-  "production_difficulty": 2
+    "trigger_moment": "Several conversations begin with generic openers",
+    "emotion_from": "sameness",
+    "emotion_to": "curiosity",
+    "product_mechanism": "voice prompts",
+    "hook_type": "recognizable micro-moment",
+    "story_pattern": "friction-mechanism-reaction",
+    "visual_format": "UGC narrative with product inserts",
+    "pace": "fast opening, warmer payoff",
+    "cta": "Start with something real",
+    "primary_test_variable": "hook situation",
+    "policy_risk": "low",
+    "production_difficulty": 2
 }
 ```
 
@@ -722,13 +721,13 @@ The `StoryboardAgent` converts the approved concept into timed shots.
 
 ### Fifteen-second target structure
 
-| Time | Function |
-|---|---|
-| 0.0–1.5s | Recognizable hook |
-| 1.5–4.0s | Friction |
-| 4.0–8.0s | Product mechanism |
-| 8.0–12.0s | Human payoff |
-| 12.0–15.0s | Brand and CTA |
+| Time       | Function          |
+| ---------- | ----------------- |
+| 0.0–1.5s   | Recognizable hook |
+| 1.5–4.0s   | Friction          |
+| 4.0–8.0s   | Product mechanism |
+| 8.0–12.0s  | Human payoff      |
+| 12.0–15.0s | Brand and CTA     |
 
 This is a guideline, not a hard template. The total duration is a hard constraint.
 
@@ -736,22 +735,22 @@ This is a guideline, not a hard template. The total duration is a hard constrain
 
 ```json
 {
-  "shot_number": 2,
-  "start_ms": 1400,
-  "duration_ms": 2100,
-  "purpose": "Establish repetitive-conversation friction",
-  "subject_id": "CHAR-001",
-  "location_id": "LOC-001",
-  "framing": "over-shoulder medium close-up",
-  "action": "The thumb pauses over a generic reply and deletes it",
-  "emotion_from": "neutral",
-  "emotion_to": "mild frustration",
-  "on_screen_text": "When every chat starts the same...",
-  "voiceover": null,
-  "audio_cue": "three restrained message sounds",
-  "requirement_ids": ["REQ-001"],
-  "continuity_from_shot": 1,
-  "continuity_to_shot": 3
+    "shot_number": 2,
+    "start_ms": 1400,
+    "duration_ms": 2100,
+    "purpose": "Establish repetitive-conversation friction",
+    "subject_id": "CHAR-001",
+    "location_id": "LOC-001",
+    "framing": "over-shoulder medium close-up",
+    "action": "The thumb pauses over a generic reply and deletes it",
+    "emotion_from": "neutral",
+    "emotion_to": "mild frustration",
+    "on_screen_text": "When every chat starts the same...",
+    "voiceover": null,
+    "audio_cue": "three restrained message sounds",
+    "requirement_ids": ["REQ-001"],
+    "continuity_from_shot": 1,
+    "continuity_to_shot": 3
 }
 ```
 
@@ -989,26 +988,26 @@ The `SceneReviewAgent` receives sampled frames plus the shot definition and chec
 
 ```json
 {
-  "decision": "reject",
-  "scores": {
-    "brief_adherence": 91,
-    "identity_consistency": 48,
-    "emotional_readability": 76,
-    "technical_quality": 84
-  },
-  "findings": [
-    {
-      "code": "IDENTITY_DRIFT",
-      "severity": "high",
-      "message": "The actor's hairstyle changes substantially."
+    "decision": "reject",
+    "scores": {
+        "brief_adherence": 91,
+        "identity_consistency": 48,
+        "emotional_readability": 76,
+        "technical_quality": 84
     },
-    {
-      "code": "MALFORMED_UI",
-      "severity": "high",
-      "message": "The phone screen is not usable as product evidence."
-    }
-  ],
-  "recommended_action": "regenerate_same_shot"
+    "findings": [
+        {
+            "code": "IDENTITY_DRIFT",
+            "severity": "high",
+            "message": "The actor's hairstyle changes substantially."
+        },
+        {
+            "code": "MALFORMED_UI",
+            "severity": "high",
+            "message": "The phone screen is not usable as product evidence."
+        }
+    ],
+    "recommended_action": "regenerate_same_shot"
 }
 ```
 
@@ -1080,34 +1079,34 @@ The LLM does not control a video editor visually. It produces or validates a ren
 
 ```json
 {
-  "composition": "dating-story-v1",
-  "canvas": {
-    "width": 1080,
-    "height": 1920,
-    "fps": 30
-  },
-  "duration_frames": 450,
-  "shots": [
-    {
-      "scene_version_id": "SCV-001",
-      "from_frame": 0,
-      "duration_frames": 42,
-      "crop": "cover",
-      "position": "center"
+    "composition": "dating-story-v1",
+    "canvas": {
+        "width": 1080,
+        "height": 1920,
+        "fps": 30
+    },
+    "duration_frames": 450,
+    "shots": [
+        {
+            "scene_version_id": "SCV-001",
+            "from_frame": 0,
+            "duration_frames": 42,
+            "crop": "cover",
+            "position": "center"
+        }
+    ],
+    "captions": [],
+    "overlays": [],
+    "audio": {
+        "voice_asset_version_id": "AUDV-010",
+        "music_asset_version_id": "AUDV-011",
+        "ducking_db": -7
+    },
+    "cta": {
+        "text": "Start with something real",
+        "from_frame": 375,
+        "logo_asset_version_id": "ASTV-090"
     }
-  ],
-  "captions": [],
-  "overlays": [],
-  "audio": {
-    "voice_asset_version_id": "AUDV-010",
-    "music_asset_version_id": "AUDV-011",
-    "ducking_db": -7
-  },
-  "cta": {
-    "text": "Start with something real",
-    "from_frame": 375,
-    "logo_asset_version_id": "ASTV-090"
-  }
 }
 ```
 
@@ -1298,24 +1297,24 @@ The `LearningAgent` compares structured creative genomes with campaign results.
 
 ```json
 {
-  "status": "supported",
-  "scope": {
-    "brand_id": "BRD-001",
-    "audience_segment_id": "AUD-003",
-    "platform": "tiktok",
-    "market": "DE"
-  },
-  "observation": "Conversation-sameness hooks produced stronger early retention than generic romantic montage openings.",
-  "evidence": {
-    "variant_ids": ["VAR-A", "VAR-C"],
-    "metric": "three_second_hold_rate",
-    "difference_percent": 19.4,
-    "sample_size": 182000
-  },
-  "limitations": [
-    "Actor presentation was not identical.",
-    "Evidence comes from one campaign."
-  ]
+    "status": "supported",
+    "scope": {
+        "brand_id": "BRD-001",
+        "audience_segment_id": "AUD-003",
+        "platform": "tiktok",
+        "market": "DE"
+    },
+    "observation": "Conversation-sameness hooks produced stronger early retention than generic romantic montage openings.",
+    "evidence": {
+        "variant_ids": ["VAR-A", "VAR-C"],
+        "metric": "three_second_hold_rate",
+        "difference_percent": 19.4,
+        "sample_size": 182000
+    },
+    "limitations": [
+        "Actor presentation was not identical.",
+        "Evidence comes from one campaign."
+    ]
 }
 ```
 
@@ -1616,21 +1615,21 @@ If PHP attributes make environment-specific routing awkward, construct provider/
 
 ## 31. Specialized agent catalog
 
-| Agent | Responsibility | Typical model tier |
-|---|---|---|
-| BrandProfileAgent | Convert intake into product truth | Luna/Terra |
-| ReferenceAdAnalysisAgent | Reconstruct structure from transcript and frames | Terra |
-| CampaignBriefAgent | Produce complete traceable brief | Terra |
-| CreativeStrategyAgent | Generate different hypotheses | Terra |
-| CopyAgent | Dialogue, captions, CTA options | Terra |
-| StoryboardAgent | Timed shot plan | Terra |
-| VisualPromptAgent | Provider-ready shot and keyframe prompts | Terra/Luna |
-| SceneReviewAgent | Evaluate sampled frames against shot | Terra |
-| PolicyReviewAgent | Structured policy findings | Terra |
-| RenderReviewAgent | Review final ad against brief | Terra |
-| MetricsNormalizationAgent | Map unfamiliar CSV columns | Luna |
-| LearningAgent | Create scoped conclusions from results | Terra |
-| CampaignInvestigationAgent | Rare open-ended root-cause analysis | Sol |
+| Agent                      | Responsibility                                   | Typical model tier |
+| -------------------------- | ------------------------------------------------ | ------------------ |
+| BrandProfileAgent          | Convert intake into product truth                | Luna/Terra         |
+| ReferenceAdAnalysisAgent   | Reconstruct structure from transcript and frames | Terra              |
+| CampaignBriefAgent         | Produce complete traceable brief                 | Terra              |
+| CreativeStrategyAgent      | Generate different hypotheses                    | Terra              |
+| CopyAgent                  | Dialogue, captions, CTA options                  | Terra              |
+| StoryboardAgent            | Timed shot plan                                  | Terra              |
+| VisualPromptAgent          | Provider-ready shot and keyframe prompts         | Terra/Luna         |
+| SceneReviewAgent           | Evaluate sampled frames against shot             | Terra              |
+| PolicyReviewAgent          | Structured policy findings                       | Terra              |
+| RenderReviewAgent          | Review final ad against brief                    | Terra              |
+| MetricsNormalizationAgent  | Map unfamiliar CSV columns                       | Luna               |
+| LearningAgent              | Create scoped conclusions from results           | Terra              |
+| CampaignInvestigationAgent | Rare open-ended root-cause analysis              | Sol                |
 
 ### Agent rule
 
@@ -3313,52 +3312,52 @@ A first useful MVP is complete when:
 
 ## 63. Important decisions already made
 
-| Decision | Choice |
-|---|---|
-| Main framework | Laravel 13 |
-| AI integration | Laravel AI SDK |
-| Workflow owner | Laravel code |
-| Agent style | Small, bounded, structured specialists |
-| Initial architecture | Modular monolith |
-| Frontend | Inertia + React + TypeScript |
-| Database | PostgreSQL |
-| Queue | Redis + Horizon |
-| Real-time | Reverb |
-| Storage | Private S3-compatible storage |
-| Renderer | Node + Remotion + FFmpeg |
-| Media generation | Replaceable provider adapters |
-| Video unit | Short scenes, not one monolithic generation |
-| Versioning | Immutable artifact versions plus lineage |
-| Approval | Human gates |
-| First analytics integration | CSV import |
-| First deployment style | Standalone control center |
-| Other-app integration | API + small Laravel client package |
-| Publishing | Export first, direct APIs later |
-| Learning | Real metrics plus structured creative genome |
+| Decision                    | Choice                                       |
+| --------------------------- | -------------------------------------------- |
+| Main framework              | Laravel 13                                   |
+| AI integration              | Laravel AI SDK                               |
+| Workflow owner              | Laravel code                                 |
+| Agent style                 | Small, bounded, structured specialists       |
+| Initial architecture        | Modular monolith                             |
+| Frontend                    | Inertia + React + TypeScript                 |
+| Database                    | PostgreSQL                                   |
+| Queue                       | Redis + Horizon                              |
+| Real-time                   | Reverb                                       |
+| Storage                     | Private S3-compatible storage                |
+| Renderer                    | Node + Remotion + FFmpeg                     |
+| Media generation            | Replaceable provider adapters                |
+| Video unit                  | Short scenes, not one monolithic generation  |
+| Versioning                  | Immutable artifact versions plus lineage     |
+| Approval                    | Human gates                                  |
+| First analytics integration | CSV import                                   |
+| First deployment style      | Standalone control center                    |
+| Other-app integration       | API + small Laravel client package           |
+| Publishing                  | Export first, direct APIs later              |
+| Learning                    | Real metrics plus structured creative genome |
 
 ---
 
 ## 64. Risks and mitigations
 
-| Risk | Mitigation |
-|---|---|
-| AI misses the brief | Requirement IDs, structured schemas, traceability, review |
-| Five variants are basically identical | Distinctness checks and explicit primary test variable |
-| Generated actors drift | Continuity package, shot-level generation, scene review |
-| Product UI is hallucinated | Deterministic screenshots/React UI inserts |
-| Costs grow through retries | Budget reservations and attempt limits |
-| Provider API changes | Contracts and adapters |
-| Queue jobs duplicate requests | Idempotency keys and unique jobs |
-| Provider callback is repeated | Webhook receipt table and replay protection |
-| Metrics attach to wrong creative | Exact external-ID to render-version mapping |
-| AI quality score becomes “truth” | Keep AI, human, and commercial scores separate |
-| Learning engine overstates results | Minimum samples, limitations, inconclusive status |
-| Policy changes | Versioned policy profiles and current rules |
-| Rights are unclear | Rights records and approval gate |
-| Sensitive data leaks | Tenant policies, private storage, log redaction |
-| Package extraction slows MVP | Application-first, package later |
-| Renderer becomes arbitrary-code risk | Fixed templates and signed validated manifests |
-| One model becomes a dependency | Configurable model routing and eval dataset |
+| Risk                                  | Mitigation                                                |
+| ------------------------------------- | --------------------------------------------------------- |
+| AI misses the brief                   | Requirement IDs, structured schemas, traceability, review |
+| Five variants are basically identical | Distinctness checks and explicit primary test variable    |
+| Generated actors drift                | Continuity package, shot-level generation, scene review   |
+| Product UI is hallucinated            | Deterministic screenshots/React UI inserts                |
+| Costs grow through retries            | Budget reservations and attempt limits                    |
+| Provider API changes                  | Contracts and adapters                                    |
+| Queue jobs duplicate requests         | Idempotency keys and unique jobs                          |
+| Provider callback is repeated         | Webhook receipt table and replay protection               |
+| Metrics attach to wrong creative      | Exact external-ID to render-version mapping               |
+| AI quality score becomes “truth”      | Keep AI, human, and commercial scores separate            |
+| Learning engine overstates results    | Minimum samples, limitations, inconclusive status         |
+| Policy changes                        | Versioned policy profiles and current rules               |
+| Rights are unclear                    | Rights records and approval gate                          |
+| Sensitive data leaks                  | Tenant policies, private storage, log redaction           |
+| Package extraction slows MVP          | Application-first, package later                          |
+| Renderer becomes arbitrary-code risk  | Fixed templates and signed validated manifests            |
+| One model becomes a dependency        | Configurable model routing and eval dataset               |
 
 ---
 

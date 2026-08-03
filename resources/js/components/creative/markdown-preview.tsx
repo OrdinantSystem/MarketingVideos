@@ -1,4 +1,5 @@
 import type { CreativeDocument } from '@/types/creative';
+import { MetadataInspector } from '@/components/creative/metadata-inspector';
 
 interface MarkdownPreviewProps {
     document: CreativeDocument;
@@ -43,7 +44,15 @@ export function MarkdownPreview({ document }: MarkdownPreviewProps) {
             ))}
             <details className="rounded-xl border border-[#e1dfd8] bg-[#f3f2ed]">
                 <summary className="cursor-pointer px-4 py-3 text-xs font-medium text-[#65706c]">
-                    Inspect raw Markdown
+                    Inspect structured front matter
+                </summary>
+                <div className="border-t border-[#deddd6] p-3">
+                    <MetadataInspector metadata={document.metadata} />
+                </div>
+            </details>
+            <details className="rounded-xl border border-[#e1dfd8] bg-[#f3f2ed]">
+                <summary className="cursor-pointer px-4 py-3 text-xs font-medium text-[#65706c]">
+                    Inspect raw Markdown body
                 </summary>
                 <pre className="creative-scrollbar max-h-80 overflow-auto border-t border-[#deddd6] p-4 font-mono text-[10px] leading-5 whitespace-pre-wrap text-[#5e6965]">
                     {document.body}

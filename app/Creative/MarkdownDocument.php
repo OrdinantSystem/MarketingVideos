@@ -3,6 +3,7 @@
 namespace App\Creative;
 
 use Illuminate\Support\Facades\File;
+use RuntimeException;
 use Symfony\Component\Yaml\Yaml;
 
 final class MarkdownDocument
@@ -28,16 +29,39 @@ final class MarkdownDocument
     }
 
     /** @param array<string, mixed> $metadata */
-    public static function write(string $path, array $metadata, string $body): void
+    public static function write(string $path, array $metadata, string $body, bool $overwrite = true): void
     {
         File::ensureDirectoryExists(dirname($path));
 
         $yaml = Yaml::dump($metadata, 4, 2, Yaml::DUMP_MULTI_LINE_LITERAL_BLOCK);
-        File::put($path, "---\n{$yaml}---\n\n".trim($body)."\n");
+        $contents = "---\n{$yaml}---\n\n".trim($body)."\n";
+        $temporary = tempnam(dirname($path), '.videoauto-');
+
+        if ($temporary === false) {
+            throw new RuntimeException('Unable to create a temporary creative document.');
+        }
+
+        try {
+            if (file_put_contents($temporary, $contents, LOCK_EX) === false) {
+                throw new RuntimeException('Unable to write a temporary creative document.');
+            }
+
+            if ($overwrite) {
+                if (! rename($temporary, $path)) {
+                    throw new RuntimeException('Unable to atomically replace a creative document.');
+                }
+            } elseif (! link($temporary, $path)) {
+                throw new RuntimeException('Creative document already exists; immutable history was not overwritten.');
+            }
+        } finally {
+            if (is_file($temporary)) {
+                unlink($temporary);
+            }
+        }
     }
 
     /** @return list<array{title: string, content: string}> */
-    private static function sections(string $body): array
+    public static function sections(string $body): array
     {
         $sections = [];
         $title = 'Document';

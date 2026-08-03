@@ -1,5 +1,11 @@
 import { Link } from '@inertiajs/react';
-import { Check, Circle, LockKeyhole } from 'lucide-react';
+import {
+    Check,
+    Circle,
+    LockKeyhole,
+    SkipForward,
+    TriangleAlert,
+} from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { CreativePhase } from '@/types/creative';
 
@@ -37,8 +43,18 @@ export function PhaseRail({ phases, projectId, runId }: PhaseRailProps) {
                                       : 'border-[#d6d6cf] bg-white text-[#858d89]',
                             )}
                         >
-                            {phase.complete ? (
+                            {phase.status === 'skipped' ? (
+                                <SkipForward
+                                    className="size-3"
+                                    aria-hidden="true"
+                                />
+                            ) : phase.complete ? (
                                 <Check className="size-3" aria-hidden="true" />
+                            ) : phase.status === 'stale' ? (
+                                <TriangleAlert
+                                    className="size-3"
+                                    aria-hidden="true"
+                                />
                             ) : phase.available ? (
                                 phase.number
                             ) : (
@@ -59,13 +75,21 @@ export function PhaseRail({ phases, projectId, runId }: PhaseRailProps) {
                                         aria-hidden="true"
                                     />
                                 )}
-                                {phase.complete
-                                    ? 'Selected'
-                                    : phase.artifact_count > 0
-                                      ? `${phase.artifact_count} files`
-                                      : phase.optional
-                                        ? 'Optional'
-                                        : phase.short}
+                                {phase.status === 'skipped'
+                                    ? 'Skipped · project idea used'
+                                    : phase.complete
+                                      ? 'Selected'
+                                      : phase.status === 'stale'
+                                        ? `${phase.selection_issue_count} stale or invalid`
+                                        : phase.selected_count > 0
+                                          ? `${phase.selected_count}/${phase.required_count} selected`
+                                          : phase.artifact_count > 0
+                                            ? `${phase.artifact_count} files`
+                                            : phase.status === 'blocked'
+                                              ? 'Needs previous selection'
+                                              : phase.optional
+                                                ? 'Optional'
+                                                : phase.short}
                             </span>
                         </span>
                     </Link>

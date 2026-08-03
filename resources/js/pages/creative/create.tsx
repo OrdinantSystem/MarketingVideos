@@ -89,7 +89,7 @@ export default function CreateProject() {
                                     {
                                         value: 'concepts',
                                         title: 'I have the idea',
-                                        copy: 'Begin by shaping 3 concepts.',
+                                        copy: 'Explicitly skip Ideas, record project.md as the source, then shape 3 concepts.',
                                     },
                                     {
                                         value: 'ideas',
